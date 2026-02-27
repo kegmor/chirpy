@@ -7,14 +7,17 @@ import (
 
 type Server struct {
 	Addr    string
-	Handler http.Handler
+	Handler *http.ServeMux
 }
 
 func main() {
-	server := Server{Addr: ":8080"}
 	mux := http.NewServeMux()
-	mux.Handle("/", http.FileServer(http.Dir(".")))
-	err := http.ListenAndServe(server.Addr, mux)
+	server := &Server{
+		Addr:    ":8080",
+		Handler: mux,
+	}
+	server.Handler.Handle("/", http.FileServer(http.Dir(".")))
+	err := http.ListenAndServe(server.Addr, server.Handler)
 	if err != nil {
 		fmt.Println("failed to start server")
 	}
