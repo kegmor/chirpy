@@ -1,6 +1,15 @@
 package main
 
 import (
+	"database/sql"
+	"os"
+
+	"github.com/joho/godotenv"
+	"github.com/kegmor/chirpy/internal/database"
+	_ "github.com/lib/pq"
+)
+
+import (
 	"encoding/json"
 	"fmt"
 	"log"
@@ -11,9 +20,20 @@ import (
 
 type apiConfig struct {
 	fileserverHits atomic.Int32
+	db             *database.Queries
 }
 
 func main() {
+	err := godotenv.Load(".env")
+	if err != nil {
+		log.Fatal("Error loading .env file")
+	}
+	dbURL := os.Getenv("DB_URL")
+	db, err := sql.Open("postgres", dbURL)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
 	const filePathRoot = "."
 	const port = "8080"
 	apiCfg := &apiConfig{}
