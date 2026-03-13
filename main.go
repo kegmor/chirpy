@@ -51,6 +51,8 @@ func main() {
 
 	mux.HandleFunc("GET /api/healthz/", handlerReadiness)
 	mux.HandleFunc("POST /api/chirps", apiCfg.handlerResponse)
+	mux.HandleFunc("GET /api/chirps", apiCfg.handlerChirps)
+	mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.handlerChirp)
 	mux.HandleFunc("POST /api/users", apiCfg.handlerUser)
 	mux.HandleFunc("GET /admin/metrics/", apiCfg.handlerMetrics)
 	mux.HandleFunc("POST /admin/reset", apiCfg.handlerReset)
@@ -63,8 +65,8 @@ func main() {
 		Handler: mux,
 	}
 	log.Fatal(server.ListenAndServe())
-
 }
+
 func handlerReadiness(w http.ResponseWriter, r *http.Request) {
 	w.Header().Add("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
@@ -203,6 +205,33 @@ func (api *apiConfig) handlerResponse(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
+}
+
+func (api *apiConfig) handlerChirps(w http.ResponseWriter, r *http.Request) {
+	chirps, err := api.db.GetAllChirps(r.Context())
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(chirps)
+}
+
+func (api *apiConfig) handlerChirp(w http.ResponseWriter, r *http.Request) {
+	chirp, err := uuid.Parse(r.PathValue("chirpID"))
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	res, err := api.db.GetChirp(r.Context(), chirp)
+	if err != nil {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(res)
 }
 
 func replaceBadWords(s string) string {
