@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
+	"github.com/kegmor/chirpy/internal/auth"
 	"github.com/kegmor/chirpy/internal/database"
 	_ "github.com/lib/pq"
 )
@@ -21,6 +22,7 @@ type apiConfig struct {
 	fileserverHits atomic.Int32
 	db             *database.Queries
 	platform       string
+	jwtSecret      string
 }
 type User struct {
 	ID        uuid.UUID `json:"id"`
@@ -42,8 +44,9 @@ func main() {
 	defer db.Close()
 	dbQueries := database.New(db)
 	apiCfg := &apiConfig{
-		db:       dbQueries,
-		platform: os.Getenv("PLATFORM"),
+		db:        dbQueries,
+		platform:  os.Getenv("PLATFORM"),
+		jwtSecret: os.Getenv("JWT_SECRET"),
 	}
 	const filePathRoot = "."
 	const port = "8080"
@@ -53,6 +56,7 @@ func main() {
 	mux.HandleFunc("POST /api/chirps", apiCfg.handlerResponse)
 	mux.HandleFunc("GET /api/chirps", apiCfg.handlerChirps)
 	mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.handlerChirp)
+	mux.HandleFunc("POST /api/login", apiCfg.handlerLogin)
 	mux.HandleFunc("POST /api/users", apiCfg.handlerUser)
 	mux.HandleFunc("GET /admin/metrics/", apiCfg.handlerMetrics)
 	mux.HandleFunc("POST /admin/reset", apiCfg.handlerReset)
@@ -116,9 +120,65 @@ func (api *apiConfig) handlerReset(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (api *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
+	type userLogin struct {
+		Email            string `json:"email"`
+		Password         string `json:"password"`
+		ExpiresInSeconds int    `json:"expires_in_seconds"`
+	}
+	type errorResponse struct {
+		Error string `json:"error"`
+	}
+	type userResponse struct {
+		User
+		Token string `json:"token"`
+	}
+	var login userLogin
+	decoder := json.NewDecoder(r.Body)
+	err := decoder.Decode(&login)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	found, err := api.db.FindUserByEmail(r.Context(), login.Email)
+	if err != nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	var user = User{
+		ID:        found.ID,
+		CreatedAt: found.CreatedAt,
+		UpdatedAt: found.UpdatedAt,
+		Email:     found.Email,
+	}
+	ok, err := auth.CheckPasswordHash(login.Password, found.HashedPassword)
+	if err != nil || !ok {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(errorResponse{Error: "Incorrect email or password"})
+		return
+	}
+
+	expiry := time.Hour
+	if login.ExpiresInSeconds > 0 && login.ExpiresInSeconds < 3600 {
+		expiry = time.Duration(login.ExpiresInSeconds) * time.Second
+	}
+
+	token, err := auth.MakeJWT(user.ID, api.jwtSecret, expiry)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(userResponse{User: user, Token: token})
+}
+
 func (api *apiConfig) handlerUser(w http.ResponseWriter, r *http.Request) {
 	type email struct {
-		Email string `json:"email"`
+		Email    string `json:"email"`
+		Password string `json:"password"`
 	}
 	var emale email
 	decoder := json.NewDecoder(r.Body)
@@ -127,12 +187,17 @@ func (api *apiConfig) handlerUser(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-
+	pass, err := auth.HashPassword(emale.Password)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
 	createdUser, err := api.db.CreateUser(r.Context(), database.CreateUserParams{
-		ID:        uuid.New(),
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
-		Email:     emale.Email,
+		ID:             uuid.New(),
+		CreatedAt:      time.Now(),
+		UpdatedAt:      time.Now(),
+		Email:          emale.Email,
+		HashedPassword: pass,
 	})
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -157,16 +222,25 @@ func (api *apiConfig) handlerUser(w http.ResponseWriter, r *http.Request) {
 func (api *apiConfig) handlerResponse(w http.ResponseWriter, r *http.Request) {
 
 	type requestBody struct {
-		Body   string `json:"body"`
-		UserId string `json:"user_id"`
+		Body string `json:"body"`
 	}
 	type errorResponse struct {
 		Error string `json:"error"`
 	}
+	tokenString, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
 
+	userID, err := auth.ValidateJWT(tokenString, api.jwtSecret)
+	if err != nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
 	var body requestBody
 	decoder := json.NewDecoder(r.Body)
-	err := decoder.Decode(&body)
+	err = decoder.Decode(&body)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
@@ -182,21 +256,18 @@ func (api *apiConfig) handlerResponse(w http.ResponseWriter, r *http.Request) {
 	}
 
 	words := replaceBadWords(body.Body)
-	userId, err := uuid.Parse(body.UserId)
-	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(errorResponse{Error: "Something went wrong"})
-		return
-	}
 
 	createdChirp, err := api.db.CreateChirp(r.Context(), database.CreateChirpParams{
 		ID:        uuid.New(),
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
 		Body:      words,
-		UserID:    userId,
+		UserID:    userID,
 	})
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusCreated)
